@@ -1,10 +1,11 @@
-;.include "c:/m16def.inc"
 .include "/usr/share/avra/m16def.inc"
 
-.def switchedOnB = r11
-.def switchedOnA = r12
-.def switchStatusB = r13
-.def switchStatusA = r14
+.def lastCandidatesB = r10
+.def lastCandidatesA = r11
+.def switchedOnB = r12
+.def switchedOnA = r13
+.def switchStatusB = r14
+.def switchStatusA = r15
 .def temp1 = r16
 .def temp2 = r17
 .def temp3 = r18
@@ -16,30 +17,21 @@
 .def scoreB = r24
 
 ;Constants
-.equ NumberOfStableSwitchReads=10
-.equ InputBit=0
-.equ CalcScoreBit=1
-.equ OutputBit=2
-.equ LightsBit=3
-.equ TimerHitBit=4
-.equ switchCounterStepLength=5 ;this many 1024/clock seconds will pass between switchchecks
+.equ TimerHitBit=1
+.equ SwitchBit=2
 .equ gameDuration=58594 ;this many 1024/clock seconds will pass until the game ends 58594 (30s at 2MHZ)
 .equ countdownStep=1953 ;this many 1024/clock seconds will pass until the countdown is decreased by one (1s @ 2 MhY)
 .equ blinkDuration=980 ;this many 1024/clock seconds will be half the frequency of the "winner blinking"
 .equ blinkRepetition=12 ;this many Times will the winner's LEDs blink, before all start twinkeling again
-.equ LEDOffTimeout=15 ;After switched off by a button, the LED will stay off this many 256*1204/clock seconds
-.equ LEDOnTimeout=10 ;After switched on, the LED will stay off this many 256*1204/clock seconds
+.equ twinkleSpeed=200 ;After this many 1024/clock seconds the next twinkle "frame" will be created and shown
+.equ switchDebounceDelay=40
 ;---------------------------------------------
 ;This Mem-area stores the Timers for switches
 ;---------------------------------------------
-.equ switchTimerMemA=SRAM_START
-.equ switchTimerMemB=switchTimerMemA+8
-.equ LEDsAMem=switchTimerMemB+8
+.equ LEDsAMem=SRAM_START
 .equ DisplayMem=LEDsAMem
 .equ LEDsBMem=LEDsAMem+1
 .equ ScoreMem=LEDsBMem+1
-.equ LEDTimerMemA=ScoreMem+8
-.equ LEDTimerMemB=LEDTimerMemA+8
 
 .cseg
 .org 0x000 
@@ -47,8 +39,7 @@
 ;.org $002 rjmp EXT_INT0 ; IRQ0 Handler
 ;.org $004 rjmp EXT_INT1 ; IRQ1 Handler
 ;.org $006 rjmp TIM2_COMP ; Timer2 Compare Handler
-.org 0x008 
-	rjmp TIM2_OVF ; Timer2 Overflow Handler
+;.org 0x008 rjmp TIM2_OVF ; Timer2 Overflow Handler
 ;.org $00A rjmp TIM1_CAPT ; Timer1 Capture Handler
 .org 0x00C 
 	rjmp TIM1_COMPA ; Timer1 CompareA Handler
@@ -64,7 +55,7 @@
 ;.org $020 rjmp ANA_COMP ; Analog Comparator Handler
 ;.org 0x022 rjmp TWSI ; Two-wire Serial Interface Handler
 ;.org $024 rjmp EXT_INT2 ; IRQ2 Handler
-.org $026 
+.org 0x026 
 	rjmp TIM0_COMP ; Timer0 Compare Handler
 ;.org $028 rjmp SPM_RDY ; Store Program Memory Ready Handler
 
@@ -111,20 +102,20 @@ out SPSR, temp1
 ;----------------------------------------------
 ;Init Timers
 ;----------------------------------------------
-ldi temp1, (1 << wgm01 | 1<<CS02 | 1<<CS00)
-out TCCR0, temp1
-ldi temp1, switchCounterStepLength
-out OCR0,temp1
-
-ldi temp1, (1 <<CS12 | 1<<CS10 | 1<<WGM12)
+ldi temp1, (1 <<CS12 | 1<<CS10 | 1<<WGM12)	;16Bit Timer 1 runs at clock/1024
 out TCCR1B,temp1
 
-ldi temp1, (1<<CS22 | 1<<CS21 | 1<<CS20)
+ldi temp1, (1<<CS00 | 1<<CS02 | 1<<WGM01 )	;8Bit Timer runs at clock 
+out TCCR0, temp1
+
+ldi temp1, (1<<CS20)				;8Bit Timer2 runs at clock as source for random bits
 out TCCR2, temp1
 
-ldi temp1, (1<<OCIE0|1<<OCIE1A| 1<<TOIE2)
+ldi temp1, (1<<OCIE1A| 1<<OCIE0)
 out TIMSK, temp1
 
+ldi temp1, switchDebounceDelay
+out OCR0, temp1
 
 ;----------------------------------------------
 ;Enable Interrupts
@@ -134,25 +125,30 @@ sei
 ;---------------------------------------------------
 ;PreGaming mode
 ;twinkle, until a button is pressed
-;Keep Score untouched
+;Keep score from previous game untouched
 ;---------------------------------------------------
 pregameMode:
 
 clr switchedOnA
 clr switchedOnB
 
-ser LEDsA
-ser LEDsB
+ldi temp1,HIGH(twinkleSpeed)
+out OCR1AH,temp1
+ldi temp1,LOW(twinkleSpeed)
+out OCR1AL,temp1
 
-rcall output
-
-pregame_loop:
-	sbrc statusRegister,LightsBit
-	rcall PreGameTwinkling
-	rcall input
+pregameLoop:
+	sbrs statusRegister,TimerHitBit
+	rjmp pregameLoopNoNewLights
+	rcall doNewLightsA				;If the Timer hits, create a new light pattern
+	rcall doNewLightsB				;If the Timer hits, create a new light pattern
+pregameLoopNoNewLights:
+	cbr statusRegister, (1<<TimerHitBit)		
+	rcall output					;Write the new pattern to the LEDs
+	rcall input					;Read the switches
 	or switchedOnA, switchedOnB
 	tst switchedOnA
-breq pregame_loop
+breq pregameLoop					;Start the game if anything was pressed
 
 ;---------------------------------------------------
 ;Countdown mode
@@ -183,7 +179,7 @@ countdown_loop:
 	sbrs statusRegister,TimerHitBit		;Decrease the Scoredisplay until it reaches 0
 		rjmp countdownNoCount
 		dec ScoreA
-		mov ScoreB,ScoreA
+		dec ScoreB
 		cbr statusRegister, (1<<TimerHitBit)
 		rcall output
 	countdownNoCount:
@@ -195,53 +191,44 @@ brne countdown_loop
 ;---------------------------------------------------
 ;Gaming mode
 ;---------------------------------------------------
-ser LEDsA					;Set All LEDs
-ser LEDsB
-ldi counter, 8					;And set corresponding Mem Timers
-ldi YH, HIGH(LEDTimerMemA)
-ldi YL, LOW(LEDTimerMemA)
-ldi temp1, LEDOnTimeout
-
-initMemALoop:
-	st Y+, temp1
-	dec counter
-brne initMemALoop
-
-ldi counter, 8					;And set corresponding Mem Timers
-ldi YH, HIGH(LEDTimerMemB)
-ldi YL, LOW(LEDTimerMemB)
-ldi temp1, LEDOnTimeout
-
-initMemBLoop:
-	st Y+, temp1
-	dec counter
-brne initMemBLoop
+rcall doNewLightsA				;Create new light pattern as start for the game
+rcall doNewLightsB				
 
 clr scoreA					;clear Score values
 clr scoreB
 
 rcall output					;Output the Score and lights
 
-clr temp1		;Reset Timer
+clr temp1					;Reset Timer
 out TCNT1H, temp1
 out TCNT1L, temp1
 
-ldi temp1,HIGH(gameDuration)	;Set Timermatch to 30s
+ldi temp1,HIGH(gameDuration)			;Set Timermatch to 30s
 out OCR1AH,temp1
 ldi temp1,LOW(gameDuration)
 out OCR1AL,temp1
 
-main_loop:
-	sbrc statusRegister, InputBit
+mainLoop:
+	sbrs statusRegister,SwitchBit
+	rjmp mainLoopDoNothing
 	rcall input
-	sbrc statusRegister, CalcScoreBit
 	rcall calcscore
-	sbrc statusRegister,OutputBit
+
+	tst switchedOnA
+	breq mainLoopNothingHappenedA
+	rcall doNewLightsA				;Create new light pattern as start for the game
+mainLoopNothingHappenedA:
+
+	tst switchedOnB
+	breq mainLoopNothingHappenedB
+	rcall doNewLightsB				
+mainLoopNothingHappenedB:
+
 	rcall output
-	sbrc statusRegister,LightsBit
-	rcall lights
+	cbr statusRegister, (1<<SwitchBit)
+mainLoopDoNothing:
 	sbrs statusRegister,TimerHitBit
-rjmp main_loop
+rjmp mainLoop
 
 
 cbr statusRegister, (1<<TimerHitBit)
@@ -296,213 +283,108 @@ brne endloop
 rjmp pregameMode		;start everything from start
 
 ;---------------------------------------------------
-;Do some twinkling
-;---------------------------------------------------
-PreGameTwinkling:
-	cbr statusRegister,(1<<LightsBit)
-	com LEDsA
-	com LEDsB
-	rcall output
-ret
-;---------------------------------------------------
 ;Make sure the buttons are debounced
 ;---------------------------------------------------
 input:
 	in temp1, PinA				;read Data
 	com temp1				;invert, because if the button is pressed it pulls to low
-	eor temp1, switchstatusA		;check what button has changed
-	ldi YH,HIGH(switchTimerMemA)
-	ldi YL,LOW(switchTimerMemA)
-	rcall checkinput			;alter the timers
-	eor switchstatusA, temp3		;if a switc is stable alter the global status
-	mov switchedOnA, temp3			
-	and switchedOnA, switchStatusA		;check which switch has changed it's status to on
-
-;do the same for the other port
+	and switchStatusA, temp1		;reset all unpressed switches
+	eor temp1, switchstatusA		;check what button is pressed but not marked as such
+	and lastCandidatesA, temp1		;check which new button was already pressed at the last check
+	mov switchedOnA, lastCandidatesA	;set the switched on marks for score evaluation
+	or switchStatusA, lastCandidatesA	;Mark button as pressed, if it was pressed the last and this time this code was run
+	mov lastCandidatesA, temp1		;save the candidates for next check
 
 	in temp1, PinC				;read Data
 	com temp1				;invert, because if the button is pressed it pulls to low
-	eor temp1, switchstatusB		;check what button has changed
-	ldi YH,HIGH(switchTimerMemB)
-	ldi YL,LOW(switchTimerMemB)
-	rcall checkinput			;alter the timers
-	eor switchstatusB, temp3		;if a switc is stable alter the global status
-	mov switchedOnB, temp3			
-	and switchedOnB, switchStatusB		;check which switch has changed it's status to on
-
-	cbr statusRegister, (1<<InputBit)	;Wait for the timer to recheck here
+	and switchStatusB, temp1		;reset all unpressed switches 
+	eor temp1, switchstatusB		;check what button is pressed but not marked as such
+	and lastCandidatesB, temp1		;check which new button was already pressed at the last check
+	mov switchedOnB, lastCandidatesB	;set the switched on marks for score evaluation
+	or switchStatusB, lastCandidatesB	;Mark button as pressed, if it was pressed the last and this time this code was run
+	mov lastCandidatesB, temp1		;save the candidates for next check
 ret
-
-checkinput:
-
-	clr temp3
-	
-	ldi counter,8
-	
-	ld temp2,Y
-	
-	checkInputLoop:
-	lsl temp1
-	brcc checkinputNoSwitchChange
-	tst temp2
-	brne checkinputLoopNotFirst
-	ldi temp2,NumberOfStableSwitchReads
-	clc 
-	rjmp checkinputLoopDone
-	
-	checkinputLoopNotFirst:
-	dec temp2
-	clc
-	brne checkinputLoopDone
-	sec
-	rjmp checkinputLoopDone
-
-	checkinputNoSwitchChange:
-	clr temp2
-	clc 
-
-	checkinputLoopDone:
-
-	rol temp3
-	st Y+,temp2
-	ld temp2,Y
-
-	dec counter
-	brne checkInputLoop
-
-	tst temp3
-	breq checkinputNoStatusChange
-	sbr statusRegister, (1<<CalcScoreBit)
-	checkinputNoStatusChange:
-ret
-
 
 calcscore:
 	mov temp1, LEDsA		;generate Bitmask that marks active LEDs which have been switched
 	and temp1, switchedOnA
-	mov temp2, LEDsA		;generate Bitmask that marks incative LEDs which have been switched
-	com temp2
-	and temp2, switchedOnA
+	rcall hammingWeight
+	add ScoreA, temp1
 
-	ldi counter, 8
-	calcScoreALoop:
-		lsl temp1
-		brcc calcScoreANoPoint
-			inc scoreA
-		calcScoreANoPoint:
-		lsl temp2
-		brcc calcScoreANoFail
-			dec scoreA
-			brpl calcScoreANoFail
-			clr scoreA
-		calcScoreANoFail:
-	dec counter
-	brne calcScoreALoop
+	mov temp1, LEDsA		;generate Bitmask that marks incative LEDs which have been switched
+	com temp1
+	and temp1, switchedOnA
+	rcall hammingWeight
+	sub ScoreA, temp1
 	
-	and switchedOnA, LEDsA		;clear the Lamps that have been switched
-	eor LEDsA, switchedOnA
-					;set Timers for LEDs that have been switched off, to keep them of for a defined time
-	ldi counter, 8
-	ldi YH, HIGH(LEDTimerMemA)
-	ldi YL, LOW(LEDTimerMemA)
-	calcScoreATimerLoop:
-		ld temp1, Y
-		lsl switchedOnA
-		brcc calcScoreATimerNoSet
-			ldi temp1, LEDOffTimeout
-		calcScoreATimerNoSet:
-		st Y+, temp1
-	dec counter
-	brne calcScoreATimerLoop
-
-	clr switchedOnA			;clear this, because it was counted
 
 	;Do the same for B
 
 	mov temp1, LEDsB		;generate Bitmask, that scores
 	and temp1, switchedOnB
-	mov temp2, LEDsB		;generate negative Scores
-	com temp2
-	and temp2, switchedOnB
+	rcall hammingWeight
+	add ScoreB, temp1
 
-	ldi counter, 8
-	calcScoreBLoop:
-		lsl temp1
-		brcc calcScoreBNoPoint
-			inc scoreB
-		calcScoreBNoPoint:
-		lsl temp2
-		brcc calcScoreBNoFail
-			dec scoreB
-			brpl calcScoreBNoFail
-			clr scoreB
-		calcScoreBNoFail:
+	mov temp1, LEDsB		;generate negative Scores
+	com temp1
+	and temp1, switchedOnB
+	rcall hammingWeight
+	sub ScoreB, temp1
+ret
 
-	dec counter
-	brne calcScoreBLoop
-	
-	and switchedOnB, LEDsB		;clear the Lamps that have been switched
-	eor LEDsB, switchedOnB
-					;set Timers for LEDs that have been switched off, to keep them of for a defined time
-	ldi counter, 8
-	ldi YH, HIGH(LEDTimerMemB)
-	ldi YL, LOW(LEDTimerMemB)
-	calcScoreBTimerLoop:
-		ld temp1, Y
-		lsl switchedOnB
-		brcc calcScoreBTimerNoSet
-			ldi temp1, LEDOffTimeout
-		calcScoreBTimerNoSet:
-		st Y+, temp1
-	dec counter
-	brne calcScoreBtimerLoop
-
-	clr switchedOnB
-	
-	sbr statusRegister, (1<<OutputBit)
-	cbr statusRegister, (1<<calcScoreBit)
+hammingWeight:
+	mov temp2, temp1
+	lsr temp2
+	andi temp1, 0b01010101
+	andi temp2, 0b01010101
+	add temp1, temp2
+	mov temp2, temp1
+	lsr temp2
+	lsr temp2
+	andi temp1, 0b00110011
+	andi temp2, 0b00110011
+	add temp1, temp2
+	mov temp2, temp1
+	swap temp2		;instead of 4 lsr 
+	andi temp1, 0b00001111
+	andi temp2, 0b00001111
+	add temp1, temp2
 ret
 
 output:
 	ldi YH,HIGH(LEDsAMem)		;Store LEDA Byte in Mem
 	ldi YL,LOW(LEDsAMem)
-	st Y, LEDsA
-
-	ldi YH,HIGH(LEDsBMem)		;Store LEDB Byte in Mem
-	ldi YL,LOW(LEDsBMem)
-	st Y, LEDsB
-
-	ldi YH, HIGH(ScoreMem)
-	ldi YL, LOW(ScoreMem)
+	st Y+, LEDsA
+	st Y+, LEDsB  			;Store LEDB Byte in Mem
 
 	mov temp1, ScoreA		;Convert the Score to Digits and write them to mem
-	clr temp2
+	clr counter
 	outputCalcDigitsA:
-		inc temp2
+		inc counter
 		subi temp1,10
 	brpl outputCalcDigitsA
-		dec temp2
+		dec counter
 		subi temp1, -10
 
 	rcall convertToDigit	
 	st Y+,temp3
-	mov temp1,temp2
+	mov temp1,counter
 	rcall convertToDigit	
 	st Y+,temp3
 
 
 	mov temp1, ScoreB
-	clr temp2
+	clr counter
 	outputCalcDigitsB:
-		inc temp2
+		inc counter
 		subi temp1,10
 	brpl outputCalcDigitsB
-		dec temp2
+		dec counter
 		subi temp1, -10
 
 	rcall convertToDigit	
 	st Y+,temp3
-	mov temp1,temp2
+	mov temp1,counter
 	rcall convertToDigit	
 	st Y+,temp3
 
@@ -522,74 +404,38 @@ output:
 	sbi PortB, PB4			;Flush Shift registers
 	cbi PortB, PB4
 
-	cbr statusRegister, (1<<OutputBit)
 ret
 
 convertToDigit:
 	ldi ZH, HIGH(digits*2)
 	ldi ZL, LOW(digits*2)
+
+	clr temp2
+
+	subi temp1,10
+	brpl convertToDigitOverHundred
+	subi temp1, -10
+	rjmp convertToDigitLoadValue
 	
+convertToDigitOverHundred:
+	ldi temp2, 0b00010000
+	
+convertToDigitLoadValue:
 	add ZL, temp1
 	brcc convertToDigitNoCarry
 		inc ZH
 	convertToDigitNoCarry:
 	lpm temp3, Z
+	eor temp3, temp2
 ret
 
 digits:
-.db ~0b11101101, ~0b00000101, ~0b10101011, ~0b00101111, ~0b01000111, ~0b01101110, ~0b11101110, ~0b00100101, ~0b11101111, ~0b01101111
+.db ~0b11101101, ~0b00000101
+.db ~0b10101011, ~0b00101111
+.db ~0b01000111, ~0b01101110
+.db ~0b11101110, ~0b00100101
+.db ~0b11101111, ~0b01101111
 
-
-lights:						;decrease each LED timer. If it hits zero, change the LED
-	ldi counter, 8
-	ldi YH, HIGH(LEDTimerMemA)
-	ldi YL, LOW(LEDTimerMemA)
-	clr temp2
-	mov temp3, LEDsA
-
-	lightsATimerLoop:		
-		lsl temp2
-		ld temp1, Y
-		dec temp1
-		brne lightsATimerNoYero
-			sbrc temp3,7
-			ldi temp1, LEDOnTimeout			;This long the LED will be on
-			sbrs temp3,7
-			ldi temp1, LEDOffTimeout		;This long the LED will be off
-			inc temp2
-		lightsATimerNoYero:
-		lsl temp3
-		st Y+, temp1
-	dec counter
-	brne lightsAtimerLoop
-	eor LEDsA, temp2
-
-	ldi counter, 8
-	ldi YH, HIGH(LEDTimerMemB)
-	ldi YL, LOW(LEDTimerMemB)
-	clr temp2
-	mov temp3, LEDsB
-
-	lightsBTimerLoop:
-		lsl temp2
-		ld temp1, Y
-		dec temp1
-		brne lightsBTimerNoYero
-			sbrc temp3,7
-			ldi temp1, LEDOnTimeout			;This long the LED will be on
-			sbrs temp3,7
-			ldi temp1, LEDOffTimeout		;This long the LED will be off
-			inc temp2
-		lightsBTimerNoYero:
-		lsl temp3
-		st Y+, temp1
-	dec counter
-	brne lightsBtimerLoop
-	eor LEDsB, temp2
-
-	cbr statusRegister, (1<<LightsBit)
-	sbr statusRegister, (1<<OutputBit)
-ret
 
 TIM1_COMPA:
 	push temp1
@@ -605,19 +451,72 @@ TIM0_COMP:
 	push temp1
 	in temp1, SREG
 	push temp1
-	sbr statusRegister, (1<<InputBit)
+	sbr statusRegister, (1<<SwitchBit)
 	pop temp1
 	out SREG, temp1
 	pop temp1
 reti
 
-TIM2_OVF:
-	push temp1
-	in temp1, SREG
-	push temp1
-	sbr statusRegister, (1<<LightsBit)
-	pop temp1
-	out SREG, temp1
-	pop temp1
-reti
 
+doNewLightsA:
+	rcall doNewLightPattern			;get a new random pattern into temp1
+
+	mov LEDsA, temp1
+	mov temp2, switchedOnA			;disable the LEDs, whose switch was pushed
+	com temp2
+	and LEDsA, temp2
+ret
+
+
+doNewLightsB:
+	rcall doNewLightPattern			;get a new random pattern into temp1
+
+	mov LEDsB, temp1
+	mov temp2, switchedOnB			;disable the LEDs, whose switch was pushed
+	com temp2
+	and LEDsB, temp2
+ret
+
+doNewLightPattern:
+	ldi ZH, HIGH(bytesWith4BitsOn*2)	;Init Pointer to Dataarea where patterns are stored
+	ldi ZL, LOW(bytesWith4BitsOn*2)
+
+	in temp1, TCNT2				;Get value of Timer 0
+	andi temp1, 0b00111111			;Reduce it to a max value of 31
+	in temp2, TCNT1L			;Get lower value of Timer 1
+	andi temp2, 0b00000110			;Reduce it to a max value of 3	
+	lsr temp2
+	add temp1, temp2			;Add these to have a pseudo random number from 0 to 34
+	add ZL, temp1				;And then add this number to the pointer to get a random pattern 
+	brcc doNewLightsNoOverflow
+		inc ZH
+	doNewLightsNoOverflow:
+
+	lpm temp1, Z				;Load the pattern
+
+	in temp2, TCNT1L			;Depending on the LSB of timer 1 invert the pattern or do not
+	andi temp2, 0b00000001
+	breq doNewLightsNoInvert
+	com temp1
+doNewLightsNoInvert:
+ret
+
+bytesWith4BitsOn:	;35 Bytes with 4 Bits on and 1 with 5.  Invert for another 35
+.db 0b11110000, 0b11101000
+.db 0b11100100, 0b11100010
+.db 0b11100001, 0b11011000
+.db 0b11010100, 0b11010010
+.db 0b11010001, 0b11001100
+.db 0b11001010, 0b11001001
+.db 0b11000110, 0b11000101
+.db 0b11000011, 0b10111000
+.db 0b10110100, 0b10110010
+.db 0b10110001, 0b10101100
+.db 0b10101010, 0b10101001
+.db 0b10100110, 0b10100101
+.db 0b10100011, 0b10011100
+.db 0b10011010, 0b10011001
+.db 0b10010110, 0b10010101
+.db 0b10010011, 0b10001110
+.db 0b10001101, 0b10001011
+.db 0b10000111, 0b11001010
