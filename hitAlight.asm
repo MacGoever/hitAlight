@@ -315,7 +315,10 @@ calcscore:
 	com temp1
 	and temp1, switchedOnA
 	rcall hammingWeight
+	tst ScoreA
+	breq calcScoreScoreAZero
 	sub ScoreA, temp1
+calcScoreScoreAZero:
 	
 
 	;Do the same for B
@@ -329,7 +332,10 @@ calcscore:
 	com temp1
 	and temp1, switchedOnB
 	rcall hammingWeight
+	tst ScoreB
+	breq calcScoreScoreBZero
 	sub ScoreB, temp1
+calcScoreScoreBZero:
 ret
 
 hammingWeight:
